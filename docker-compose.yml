@@ -29,16 +29,16 @@ services:
     networks:
       - app-network
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
     depends_on:
       redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
-      interval: 30s
+      interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
       start_period: 10s
     deploy:
       resources:
@@ -52,8 +52,8 @@ services:
     networks:
       - app-network
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
     depends_on:
       redis:
         condition: service_healthy
@@ -71,9 +71,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - API_URL=http://api:8000
+      - API_URL=${API_URL:-http://api:8000}
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     deploy:
       resources:
         limits:
