@@ -18,7 +18,7 @@ jobs:
         run: pip install flake8
 
       - name: Lint Python
-        run: flake8 api/main.py worker/worker.py --max-line-length=100 --ignore=E302,E305,W292,F821,E401,E402
+        run: flake8 api/main.py worker/worker.py --max-line-length=100
 
       - uses: actions/setup-node@v4
         with:
