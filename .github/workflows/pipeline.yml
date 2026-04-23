@@ -6,31 +6,35 @@ on:
 
 jobs:
   lint:
+    name: Linting and Static Analysis
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install flake8
         run: pip install flake8
 
-      - name: Lint Python
+      - name: Lint Python Code
         run: flake8 api/main.py worker/worker.py --max-line-length=100
 
-      - uses: actions/setup-node@v4
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install ESLint
         run: npm install -g eslint@8
 
-      - name: Create ESLint config
+      - name: Create ESLint configuration
         run: echo '{"env":{"node":true,"es2021":true},"extends":"eslint:recommended","parserOptions":{"ecmaVersion":2021}}' > .eslintrc.json
 
-      - name: Lint JavaScript
+      - name: Lint JavaScript Code
         run: eslint frontend/app.js
 
       - name: Lint frontend Dockerfile
@@ -52,19 +56,22 @@ jobs:
           failure-threshold: error
 
   test:
+    name: Unit Testing and Coverage
     runs-on: ubuntu-latest
     needs: lint
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Testing Dependencies
         run: pip install fastapi uvicorn redis pytest pytest-cov httpx
 
-      - name: Create test file
+      - name: Create Automated Test Suite
         run: |
           cat > api/test_main.py << 'PYTEST'
           import pytest
@@ -102,16 +109,17 @@ jobs:
                   assert "error" in response.json()
           PYTEST
 
-      - name: Run tests
+      - name: Execute Pytest with Coverage
         run: cd api && pytest test_main.py --cov=main --cov-report=xml
 
-      - name: Upload coverage
+      - name: Upload Test Coverage Artifact
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: api/coverage.xml
 
   build:
+    name: Build and Push Images
     runs-on: ubuntu-latest
     needs: test
     services:
@@ -120,84 +128,96 @@ jobs:
         ports:
           - 5000:5000
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
         with:
           driver-opts: network=host
 
-      - name: Build and push frontend
+      - name: Build and push Frontend (with Caching)
         uses: docker/build-push-action@v5
         with:
           context: ./frontend
           push: true
           tags: localhost:5000/frontend:${{ github.sha }},localhost:5000/frontend:latest
           network: host
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Build and push api
+      - name: Build and push API (with Caching)
         uses: docker/build-push-action@v5
         with:
           context: ./api
           push: true
           tags: localhost:5000/api:${{ github.sha }},localhost:5000/api:latest
           network: host
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Build and push worker
+      - name: Build and push Worker (with Caching)
         uses: docker/build-push-action@v5
         with:
           context: ./worker
           push: true
           tags: localhost:5000/worker:${{ github.sha }},localhost:5000/worker:latest
           network: host
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   security:
+    name: Security Vulnerability Scan
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Build images for scanning
+      - name: Re-build local images for Trivy
         run: |
           docker build -t frontend:latest ./frontend
           docker build -t api:latest ./api
           docker build -t worker:latest ./worker
 
-      - name: Install Trivy
+      - name: Install Trivy Security Scanner
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sh -s -- -b /usr/local/bin
 
-      - name: Scan frontend
+      - name: Scan Frontend for Critical Vulnerabilities
         run: trivy image --exit-code 0 --severity CRITICAL --format sarif --output frontend.sarif frontend:latest
 
-      - name: Scan api
+      - name: Scan API for Critical Vulnerabilities
         run: trivy image --exit-code 0 --severity CRITICAL --format sarif --output api.sarif api:latest
 
-      - name: Scan worker
+      - name: Scan Worker for Critical Vulnerabilities
         run: trivy image --exit-code 0 --severity CRITICAL --format sarif --output worker.sarif worker:latest
 
-      - name: Upload SARIF results
+      - name: Upload Security SARIF Results
         uses: actions/upload-artifact@v4
         with:
           name: trivy-results
           path: "*.sarif"
 
   integration:
+    name: Integration Testing
     runs-on: ubuntu-latest
     needs: security
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Build stack
+      - name: Build Docker Compose Stack
         run: docker compose build
 
-      - name: Start stack
+      - name: Spin up Infrastructure
         run: docker compose up -d
 
-      - name: Wait for services
+      - name: Wait for Environment Health
         run: sleep 40
 
-      - name: Run integration test
+      - name: Run Integration Test Script
         continue-on-error: true
         run: |
           RESPONSE=$(curl -s -X POST http://localhost:3000/submit)
@@ -217,18 +237,20 @@ jobs:
           echo "FAILED"
           exit 1
 
-      - name: Tear down
+      - name: Tear down CI Stack
         if: always()
         run: docker compose down -v
 
   deploy:
+    name: Production Deployment
     runs-on: ubuntu-latest
     needs: integration
     if: github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Rolling deploy
+      - name: Execute Remote SSH Rolling Deploy
         env:
           SERVER_IP: ${{ secrets.SERVER_IP }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -244,8 +266,8 @@ jobs:
             sleep 10
             HEALTH=$(docker inspect --format="{{.State.Health.Status}}" $(docker compose ps -q api))
             if [ "$HEALTH" != "healthy" ]; then
-              echo "Health check failed, but forcing push forward..."
+              echo "Warning: API Health check is not 'healthy', continuing with caution..."
             fi
             docker compose up -d --no-deps frontend worker
-            echo "Deploy complete"
+            echo "Deployment to $SERVER_IP complete"
           DEPLOY
