@@ -1,0 +1,190 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["**"]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install flake8
+      - run: flake8 api/main.py worker/worker.py --max-line-length=100
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install -g eslint
+      - run: |
+          cat > .eslintrc.json << 'ESLINT'
+          {"env":{"node":true,"es2021":true},"extends":"eslint:recommended","parserOptions":{"ecmaVersion":2021}}
+          ESLINT
+      - run: eslint frontend/app.js
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: api/Dockerfile
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: worker/Dockerfile
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install fastapi uvicorn redis pytest pytest-cov httpx
+      - run: |
+          cat > api/test_main.py << 'PYTEST'
+          import pytest
+          from fastapi.testclient import TestClient
+          from unittest.mock import patch, MagicMock
+          import sys, os
+          sys.path.insert(0, os.path.dirname(__file__))
+          with patch("redis.Redis") as mock_redis:
+              mock_r = MagicMock()
+              mock_redis.return_value = mock_r
+              from main import app
+          client = TestClient(app)
+          def test_health():
+              response = client.get("/health")
+              assert response.status_code == 200
+          def test_create_job():
+              with patch("main.r") as mock_r:
+                  mock_r.lpush.return_value = 1
+                  mock_r.hset.return_value = True
+                  response = client.post("/jobs")
+                  assert response.status_code == 200
+                  assert "job_id" in response.json()
+          def test_get_job_found():
+              with patch("main.r") as mock_r:
+                  mock_r.hget.return_value = b"completed"
+                  response = client.get("/jobs/test-id-123")
+                  assert response.status_code == 200
+                  assert response.json()["status"] == "completed"
+          def test_get_job_not_found():
+              with patch("main.r") as mock_r:
+                  mock_r.hget.return_value = None
+                  response = client.get("/jobs/nonexistent")
+                  assert response.status_code == 200
+                  assert "error" in response.json()
+          PYTEST
+      - run: cd api && pytest test_main.py --cov=main --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: api/coverage.xml
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: localhost:5000/frontend:${{ github.sha }},localhost:5000/frontend:latest
+          network: host
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          push: true
+          tags: localhost:5000/api:${{ github.sha }},localhost:5000/api:latest
+          network: host
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./worker
+          push: true
+          tags: localhost:5000/worker:${{ github.sha }},localhost:5000/worker:latest
+          network: host
+
+  security:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          docker build -t frontend:latest ./frontend
+          docker build -t api:latest ./api
+          docker build -t worker:latest ./worker
+      - run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - run: trivy image --exit-code 0 --severity CRITICAL --format sarif --output frontend.sarif frontend:latest
+      - run: trivy image --exit-code 0 --severity CRITICAL --format sarif --output api.sarif api:latest
+      - run: trivy image --exit-code 0 --severity CRITICAL --format sarif --output worker.sarif worker:latest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: "*.sarif"
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: security
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose build
+      - run: docker compose up -d
+      - run: sleep 30
+      - run: |
+          RESPONSE=$(curl -s -X POST http://localhost:3000/submit)
+          echo "Response: $RESPONSE"
+          JOB_ID=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+          echo "Job ID: $JOB_ID"
+          for i in $(seq 1 20); do
+            STATUS=$(curl -s http://localhost:3000/status/$JOB_ID | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))")
+            echo "Attempt $i: status=$STATUS"
+            if [ "$STATUS" = "completed" ]; then
+              echo "SUCCESS"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "FAILED: job did not complete"
+          exit 1
+      - if: always()
+        run: docker compose down -v
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: integration
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rolling deploy
+        env:
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          echo "$SSH_PRIVATE_KEY" > /tmp/key
+          chmod 600 /tmp/key
+          ssh -i /tmp/key -o StrictHostKeyChecking=no $SSH_USER@$SERVER_IP << 'DEPLOY'
+            cd ~/hng14-stage2-devops
+            git pull origin main
+            docker compose build
+            docker compose up -d --no-deps api
+            sleep 10
+            HEALTH=$(docker inspect --format="{{.State.Health.Status}}" $(docker compose ps -q api))
+            if [ "$HEALTH" != "healthy" ]; then
+              echo "Health check failed"
+              exit 1
+            fi
+            docker compose up -d --no-deps frontend worker
+            echo "Deploy complete"
+          DEPLOY
